@@ -32,6 +32,7 @@ type LoggedInUser struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
 	Token	  string	`json:"token"`
+	RefreshToken string `json:"refresh_token"`
 }
 
 type Chirp struct {
@@ -140,7 +141,6 @@ func (cfg *apiConfig) handlerUserLogin(w http.ResponseWriter, req *http.Request)
 	type parameters struct {
 		Password	string `json:"password"`
 		Email		string `json:"email"`
-		ExpiresInSeconds int `json:"expires_in_seconds"`
 	}
 	
 	decoder := json.NewDecoder(req.Body)
@@ -162,20 +162,32 @@ func (cfg *apiConfig) handlerUserLogin(w http.ResponseWriter, req *http.Request)
 		respondWithError(w, http.StatusUnauthorized, "incorrect email or password", err)
 		return
 	}
+		
 	
-
-	var timeOut int
-	if params.ExpiresInSeconds <= 0 || params.ExpiresInSeconds >= 3600 {
-		timeOut = 3600
-	} else {
-		timeOut = params.ExpiresInSeconds 
-	}
-	
-	log.Println("Timeout Set To", timeOut)
-	token, err := auth.MakeJWT(user.ID, cfg.secret, time.Duration(timeOut) * time.Second)
+	token, err := auth.MakeJWT(user.ID, cfg.secret, time.Duration(3600) * time.Second)
 	if err != nil {
 		log.Println("Error: ", err)
 		respondWithError(w, http.StatusInternalServerError, "could not make JWT", err)
+	}
+	
+	refreshToken, _ := auth.MakeRefreshToken()
+	refreshParams := database.CreateRefreshTokenParams{
+		Token: refreshToken,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID: user.ID,
+		ExpiresAt: time.Now().Add(time.Duration(60) * time.Duration(24) * time.Hour),
+		RevokedAt: sql.NullTime{
+			Time: time.Time{},	
+			Valid: false,
+		},
+	}
+
+	_, err = cfg.db.CreateRefreshToken(context.Background(), refreshParams)
+	if err != nil {
+		log.Println("error inserting refresh token", refreshParams)
+		respondWithError(w, http.StatusInternalServerError, "error creating refresh token", err)
+		return
 	}
 
 	taggedLoggedInUser := LoggedInUser{
@@ -184,6 +196,7 @@ func (cfg *apiConfig) handlerUserLogin(w http.ResponseWriter, req *http.Request)
 		UpdatedAt: user.UpdatedAt,
 		Email: user.Email,
 		Token: token,
+		RefreshToken: refreshToken,
 	}
 	
 	log.Println("user: ", user.ID, "  logged in with token  ", token)
@@ -297,6 +310,65 @@ func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, req *http.Request){
 	})
 }
 
+func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, req *http.Request){
+
+	token, err := auth.GetBearerToken(req.Header)	
+	if err != nil {
+		log.Println("could not parse refresh token ", err)
+		respondWithError(w, http.StatusBadRequest, "invalid authorization", err)
+	}
+	
+	refreshToken, err := cfg.db.GetRefreshTokenByToken(context.Background(), token)
+	if err != nil {
+		log.Println("could not find refresh token in database ", err)
+		respondWithError(w, http.StatusBadRequest, "invalid authorization", err)
+		return
+	}
+	
+	if refreshToken.ExpiresAt.Before(time.Now()) || refreshToken.RevokedAt.Valid  {
+		log.Println("user attempted login with invlalidated token")
+		respondWithError(w, http.StatusUnauthorized, "session expired", err)
+		return
+	}
+
+	accessToken, err := auth.MakeJWT(refreshToken.UserID, cfg.secret, time.Duration(3600) * time.Second)
+	if err != nil {
+		log.Println("Error: ", err)
+		respondWithError(w, http.StatusInternalServerError, "could not make JWT", err)
+	}
+
+	response :=	struct{
+		Token	string `json:"token"`
+	} {
+		Token: accessToken,
+	}
+
+	respondWithJSON(w, http.StatusOK, response)
+}
+
+func (cfg *apiConfig) handlerRevoke(w http.ResponseWriter, req *http.Request){
+
+	token, err := auth.GetBearerToken(req.Header)	
+	if err != nil {
+		log.Println("could not parse refresh token ", err)
+		respondWithError(w, http.StatusBadRequest, "invalid authorization", err)
+	}
+	
+	updateParams := database.RevokeTokenParams{
+		Token: token,
+		UpdatedAt: time.Now(),
+	}
+
+	err = cfg.db.RevokeToken(context.Background(), updateParams)
+	if err != nil {
+		log.Println("tried to revoke token and failed ", err)
+		respondWithError(w, http.StatusInternalServerError, "unable to revoke token", err)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)	
+}
+
 func main() {
 
 	const port = "8080"
@@ -332,9 +404,11 @@ func main() {
 	})
 
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset) 
+	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke) 
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser) 
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp) 
 	mux.HandleFunc("POST /api/login", apiCfg.handlerUserLogin) 
+	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh) 
 
 	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps) 
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirp) 
