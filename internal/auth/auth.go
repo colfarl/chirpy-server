@@ -86,10 +86,27 @@ func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
 	return userID, nil
 }
 
+func GetAPIKey(header http.Header) (string, error) {
+	str := header.Get("Authorization")
+	inputs := strings.Fields(str)
+	if len(inputs) != 2 {
+		return "", errors.New("invalid request header")
+	}
+	tokenString := inputs[1]
+	if str == "" || tokenString == "" || inputs[0] != "ApiKey"{
+		return "", errors.New("invalid authorization")
+	}
+	return tokenString, nil
+}
+
 func GetBearerToken(header http.Header) (string, error) {
 	str := header.Get("Authorization")
-	tokenString := strings.Fields(str)[1]
-	if str == "" || tokenString == "" || strings.Fields(str)[0] != "Bearer"{
+	inputs := strings.Fields(str)
+	if len(inputs) != 2 {
+		return "", errors.New("invalid request header")
+	}
+	tokenString := inputs[1]
+	if str == "" || tokenString == "" || inputs[0] != "Bearer"{
 		return "", errors.New("invalid authorization")
 	}
 	return tokenString, nil
